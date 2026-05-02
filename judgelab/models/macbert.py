@@ -18,12 +18,22 @@ class TrainConfig:
     learning_rate: float = 2e-5
     warmup_ratio: float = 0.1
     weight_decay: float = 0.01
+    metadata: Dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class PredictConfig:
     model_dir: Path
     text_column: str = "摘要"
+    max_length: int = 256
+    batch_size: int = 16
+
+
+@dataclass(frozen=True)
+class EvaluateConfig:
+    model_dir: Path
+    text_column: str = "摘要"
+    label_column: str = "标签"
     max_length: int = 256
     batch_size: int = 16
 
@@ -56,13 +66,24 @@ def compute_metrics(predictions: Sequence[int], labels: Sequence[int]) -> Dict[s
     total = len(labels)
     correct = sum(1 for pred, label in zip(predictions, labels) if pred == label)
     tp = sum(1 for pred, label in zip(predictions, labels) if pred == 1 and label == 1)
+    tn = sum(1 for pred, label in zip(predictions, labels) if pred == 0 and label == 0)
     fp = sum(1 for pred, label in zip(predictions, labels) if pred == 1 and label == 0)
     fn = sum(1 for pred, label in zip(predictions, labels) if pred == 0 and label == 1)
     precision = tp / (tp + fp) if tp + fp > 0 else 0.0
     recall = tp / (tp + fn) if tp + fn > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
     accuracy = correct / total if total > 0 else 0.0
-    return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
+    return {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "support": total,
+        "tp": tp,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+    }
 
 
 def train_classifier(
@@ -138,15 +159,36 @@ def train_classifier(
                 encoding="utf-8",
             )
 
-    test_metrics = evaluate(model, test_loader, device, torch) if test_samples else {}
+    best_model = AutoModelForSequenceClassification.from_pretrained(config.output_dir)
+    best_model.to(device)
+    best_model.eval()
+
+    train_eval_loader = DataLoader(dataset_cls(train_samples), batch_size=config.batch_size, shuffle=False)
+    train_result = evaluate_with_details(best_model, train_eval_loader, train_samples, device, torch) if train_samples else {"metrics": {}, "details": []}
+    val_result = evaluate_with_details(best_model, val_loader, val_samples, device, torch) if val_samples else {"metrics": {}, "details": []}
+    test_result = evaluate_with_details(best_model, test_loader, test_samples, device, torch) if test_samples else {"metrics": {}, "details": []}
     result = {
         "model_dir": str(config.output_dir),
         "train_size": len(train_samples),
         "val_size": len(val_samples),
         "test_size": len(test_samples),
-        "best_val_metrics": best_val_metrics,
-        "test_metrics": test_metrics,
+        "train_metrics": train_result["metrics"],
+        "best_val_metrics": val_result["metrics"] or best_val_metrics,
+        "test_metrics": test_result["metrics"],
+        "metadata": config.metadata or {},
     }
+    (config.output_dir / "evaluation_details.json").write_text(
+        json.dumps(
+            {
+                "train": train_result["details"],
+                "validation": val_result["details"],
+                "test": test_result["details"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     (config.output_dir / "training_result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
 
@@ -194,7 +236,7 @@ def predict_texts(texts: Sequence[str], tokenizer: Any, model: Any, device: Any,
 
 def evaluate(model: Any, dataloader: Any, device: Any, torch: Any) -> Dict[str, float]:
     if len(dataloader) == 0:
-        return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0, "loss": 0.0}
+        return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0, "loss": 0.0, "support": 0, "tp": 0, "tn": 0, "fp": 0, "fn": 0}
     model.eval()
     predictions: List[int] = []
     labels: List[int] = []
@@ -210,6 +252,74 @@ def evaluate(model: Any, dataloader: Any, device: Any, torch: Any) -> Dict[str, 
     metrics = compute_metrics(predictions, labels)
     metrics["loss"] = total_loss / max(1, len(dataloader))
     return metrics
+
+
+def evaluate_with_details(model: Any, dataloader: Any, samples: Sequence[Dict[str, Any]], device: Any, torch: Any) -> Dict[str, Any]:
+    metrics = evaluate(model, dataloader, device, torch)
+    if len(dataloader) == 0:
+        return {"metrics": metrics, "details": []}
+
+    model.eval()
+    details: List[Dict[str, Any]] = []
+    sample_offset = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = {key: value.to(device) for key, value in batch.items()}
+            outputs = model(**batch)
+            probs = torch.softmax(outputs.logits, dim=-1)
+            pred_ids = torch.argmax(probs, dim=-1).cpu().tolist()
+            labels = batch["labels"].cpu().tolist()
+            batch_size = len(labels)
+            batch_samples = list(samples[sample_offset : sample_offset + batch_size])
+            sample_offset += batch_size
+            for sample, pred_id, label_id, prob_row in zip(batch_samples, pred_ids, labels, probs.cpu().tolist()):
+                details.append(
+                    {
+                        "index": sample["index"],
+                        "text": sample["text"],
+                        "true_label": label_id,
+                        "predicted_label": pred_id,
+                        "positive_probability": float(prob_row[1]),
+                        "confidence": float(prob_row[pred_id]),
+                        "is_correct": pred_id == label_id,
+                    }
+                )
+    return {"metrics": metrics, "details": details}
+
+
+def evaluate_saved_model(records: Sequence[Dict[str, Any]], config: EvaluateConfig) -> Dict[str, Any]:
+    torch, AutoModelForSequenceClassification, AutoTokenizer = _load_prediction_deps()
+    samples = build_samples(records, config.text_column, config.label_column)
+    if not samples:
+        return {"metrics": {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0, "loss": 0.0, "support": 0, "tp": 0, "tn": 0, "fp": 0, "fn": 0}, "details": []}
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_dir)
+    model = AutoModelForSequenceClassification.from_pretrained(config.model_dir)
+    device = get_device(torch)
+    model.to(device)
+    model.eval()
+
+    texts = [sample["text"] for sample in samples]
+    predictions = predict_texts(texts, tokenizer, model, device, torch, config.max_length, config.batch_size)
+    pred_labels = [int(item["label"]) for item in predictions]
+    true_labels = [int(sample["label"]) for sample in samples]
+    metrics = compute_metrics(pred_labels, true_labels)
+    metrics["loss"] = 0.0
+    details: List[Dict[str, Any]] = []
+    for sample, prediction, true_label in zip(samples, predictions, true_labels):
+        pred_label = int(prediction["label"])
+        details.append(
+            {
+                "index": sample["index"],
+                "text": sample["text"],
+                "true_label": true_label,
+                "predicted_label": pred_label,
+                "positive_probability": float(prediction["positive_probability"]),
+                "confidence": float(prediction["confidence"]),
+                "is_correct": pred_label == true_label,
+            }
+        )
+    return {"metrics": metrics, "details": details}
 
 
 def get_device(torch: Any) -> Any:
@@ -261,4 +371,3 @@ def _load_prediction_deps() -> Any:
     except ImportError as exc:
         raise RuntimeError("缺少 MacBERT 预测依赖，请安装 requirements.txt 中的 torch 和 transformers。") from exc
     return torch, AutoModelForSequenceClassification, AutoTokenizer
-

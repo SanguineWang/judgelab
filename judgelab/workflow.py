@@ -284,7 +284,7 @@ def preview_table(store: WorkspaceStore, dataset_id: str, table_name: str, limit
     return [dict(zip(columns, row)) for row in rows]
 
 
-def fetch_table_records(store: WorkspaceStore, dataset_id: str, table_name: str, limit: int | None = None) -> List[Dict[str, Any]]:
+def fetch_table_records(store: WorkspaceStore, dataset_id: str, table_name: str, limit: int | None = None, offset: int = 0) -> List[Dict[str, Any]]:
     import duckdb
 
     db_path = store.duckdb_path(dataset_id)
@@ -293,11 +293,14 @@ def fetch_table_records(store: WorkspaceStore, dataset_id: str, table_name: str,
     with duckdb.connect(str(db_path)) as conn:
         if not table_exists(conn, table_name):
             return []
+        columns = [row[1] for row in conn.execute(f"PRAGMA table_info({quote_ident(table_name)})").fetchall()]
         sql = f"SELECT * FROM {quote_ident(table_name)}"
+        if "__record_id" in columns:
+            sql += " ORDER BY __record_id"
         params: tuple[Any, ...] = ()
         if limit is not None:
-            sql += " LIMIT ?"
-            params = (limit,)
+            sql += " LIMIT ? OFFSET ?"
+            params = (limit, max(0, int(offset)))
         rows = conn.execute(sql, params).fetchall()
         columns = [description[0] for description in conn.description]
     return [dict(zip(columns, row)) for row in rows]
@@ -321,6 +324,42 @@ def replace_records_table(store: WorkspaceStore, dataset_id: str, table_name: st
         conn.execute(f"DROP TABLE IF EXISTS {quote_ident(table_name)}")
         column_sql = ", ".join(f"{quote_ident(column)} VARCHAR" for column in columns)
         conn.execute(f"CREATE TABLE {quote_ident(table_name)} ({column_sql})")
+        placeholders = ", ".join(["?"] * len(columns))
+        conn.executemany(
+            f"INSERT INTO {quote_ident(table_name)} VALUES ({placeholders})",
+            [[none_to_empty(record.get(column)) for column in columns] for record in records],
+        )
+        count = table_count(conn, table_name)
+    return AssetResult(table_name=table_name, row_count=count)
+
+
+def append_records_table(store: WorkspaceStore, dataset_id: str, table_name: str, records: List[Dict[str, Any]]) -> AssetResult:
+    import duckdb
+
+    db_path = store.duckdb_path(dataset_id)
+    if not records:
+        existing_count = 0
+        with duckdb.connect(str(db_path)) as conn:
+            if table_exists(conn, table_name):
+                existing_count = table_count(conn, table_name)
+        return AssetResult(table_name=table_name, row_count=existing_count)
+
+    columns: List[str] = []
+    seen = set()
+    for record in records:
+        for key in record:
+            if key not in seen:
+                columns.append(key)
+                seen.add(key)
+
+    with duckdb.connect(str(db_path)) as conn:
+        if not table_exists(conn, table_name):
+            column_sql = ", ".join(f"{quote_ident(column)} VARCHAR" for column in columns)
+            conn.execute(f"CREATE TABLE {quote_ident(table_name)} ({column_sql})")
+        else:
+            existing_columns = [row[1] for row in conn.execute(f"PRAGMA table_info({quote_ident(table_name)})").fetchall()]
+            if existing_columns != columns:
+                raise ValueError(f"追加写入失败，{table_name} 字段结构不一致。")
         placeholders = ", ".join(["?"] * len(columns))
         conn.executemany(
             f"INSERT INTO {quote_ident(table_name)} VALUES ({placeholders})",

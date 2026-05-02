@@ -11,9 +11,10 @@ import streamlit as st
 
 from judgelab.importer import ImportOptions, import_excel_files, preflight_excel_files
 from judgelab.llm import LlmJudgeConfig, call_chat_json
-from judgelab.models.macbert import TrainConfig, train_classifier
+from judgelab.models.macbert import EvaluateConfig, PredictConfig, TrainConfig, evaluate_saved_model, predict_records, train_classifier
 from judgelab.workspace import Dataset, DatasetStats, WorkspaceStore, quote_ident
 from judgelab.workflow import (
+    append_records_table,
     clear_downstream_assets,
     count_filtered_records,
     create_filtered_sample,
@@ -356,7 +357,7 @@ def render_flow_nav(dataset: Dataset, stats: DatasetStats, asset_stats: dict[str
         "labeled": ("done" if asset_stats.get("reviewed", 0) else ("ready" if asset_stats.get("sampled", 0) else "locked"), f"质检 {asset_stats.get('reviewed', 0):,} 行" if asset_stats.get("reviewed", 0) else (f"初标 {asset_stats.get('labeled', 0):,} 行" if asset_stats.get("labeled", 0) else "待初标")),
         "splits": ("done" if asset_stats.get("train", 0) else ("ready" if asset_stats.get("reviewed", 0) or asset_stats.get("labeled", 0) or asset_stats.get("sampled", 0) else "locked"), f"训练 {asset_stats.get('train', 0):,} 行" if asset_stats.get("train", 0) else "待划分"),
         "model": ("done" if model_result_ready else ("ready" if asset_stats.get("train", 0) else "locked"), "已训练" if model_result_ready else "待训练"),
-        "predictions": ("done" if asset_stats.get("predictions", 0) else ("ready" if asset_stats.get("train", 0) else "locked"), f"{asset_stats.get('predictions', 0):,} 行" if asset_stats.get("predictions", 0) else "待预测"),
+        "predictions": ("done" if asset_stats.get("predictions", 0) else ("ready" if model_result_ready else "locked"), f"{asset_stats.get('predictions', 0):,} 行" if asset_stats.get("predictions", 0) else "待判定"),
     }
     active_step = st.session_state.get("active_step", "raw")
     with st.container(key="flow_nav"):
@@ -905,6 +906,23 @@ def render_training_panel(dataset: Dataset, asset_stats: dict[str, int]) -> None
                     learning_rate=float(learning_rate),
                     warmup_ratio=float(warmup_ratio),
                     weight_decay=float(weight_decay),
+                    metadata={
+                        "dataset_id": dataset.dataset_id,
+                        "dataset_name": dataset.name,
+                        "split": load_ui_config(dataset.dataset_id).get("split", {}),
+                        "training": {
+                            "engine": engine,
+                            "base_model": base_model,
+                            "text_column": text_column,
+                            "label_column": label_column,
+                            "max_length": int(max_length),
+                            "batch_size": int(batch_size),
+                            "epochs": int(epochs),
+                            "learning_rate": float(learning_rate),
+                            "warmup_ratio": float(warmup_ratio),
+                            "weight_decay": float(weight_decay),
+                        },
+                    },
                 ),
                 log=append_log,
             )
@@ -919,33 +937,612 @@ def render_training_panel(dataset: Dataset, asset_stats: dict[str, int]) -> None
 
 
 def latest_training_result(dataset_id: str) -> dict | None:
+    training_dir = latest_training_dir(dataset_id)
+    if training_dir is None:
+        return None
+    result_path = training_dir / "training_result.json"
+    if not result_path.exists():
+        return None
+    try:
+        return json.loads(result_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def latest_training_dir(dataset_id: str) -> Path | None:
     models_dir = STORE.dataset_dir(dataset_id) / "models"
     if not models_dir.exists():
         return None
     result_files = sorted(models_dir.glob("*/training_result.json"), key=lambda path: path.stat().st_mtime, reverse=True)
     if not result_files:
         return None
+    return result_files[0].parent
+
+
+def list_training_dirs(dataset_id: str) -> list[Path]:
+    models_dir = STORE.dataset_dir(dataset_id) / "models"
+    if not models_dir.exists():
+        return []
+    return sorted(
+        [path.parent for path in models_dir.glob("*/training_result.json")],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def load_training_result_from_dir(training_dir: Path) -> dict | None:
+    result_path = training_dir / "training_result.json"
+    if not result_path.exists():
+        return None
     try:
-        return json.loads(result_files[0].read_text(encoding="utf-8"))
+        return json.loads(result_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
 
 
-def render_prediction_panel(dataset: Dataset, asset_stats: dict[str, int]) -> None:
-    st.markdown("#### 全量预测")
-    if not asset_stats.get("train", 0):
-        st.info("完成模型训练后，这里会按批读取原始数据并写入预测结果。")
-        return
-    st.markdown(
-        """
-        设计目标：
+def load_evaluation_details_from_dir(training_dir: Path) -> dict[str, list[dict]] | None:
+    detail_path = training_dir / "evaluation_details.json"
+    if not detail_path.exists():
+        return None
+    try:
+        payload = json.loads(detail_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return {
+        "train": payload.get("train", []) if isinstance(payload, dict) else [],
+        "validation": payload.get("validation", []) if isinstance(payload, dict) else [],
+        "test": payload.get("test", []) if isinstance(payload, dict) else [],
+    }
 
-        - 分批读取 `raw_records`
-        - 批量预测
-        - 预测结果写入 `predictions`
-        - 低置信度样本回流到复核池
-        """
+
+def latest_evaluation_details(dataset_id: str) -> dict[str, list[dict]] | None:
+    training_dir = latest_training_dir(dataset_id)
+    if training_dir is None:
+        return None
+    return load_evaluation_details_from_dir(training_dir)
+
+
+def render_prediction_panel(dataset: Dataset, asset_stats: dict[str, int]) -> None:
+    st.markdown("#### 结果验证")
+    training_dirs = list_training_dirs(dataset.dataset_id)
+    if not training_dirs:
+        if not asset_stats.get("train", 0):
+            st.info("请先完成数据集划分并训练模型。结果节点会展示模型对当前验证集/测试集的判定准确度。")
+        else:
+            st.info("请先完成模型训练。")
+        return
+    training_labels = [path.name for path in training_dirs]
+    selected_label = st.selectbox("选择模型版本", training_labels, index=0, key=f"result_model_version_{dataset.dataset_id}")
+    selected_dir = training_dirs[training_labels.index(selected_label)]
+    result = load_training_result_from_dir(selected_dir) or {}
+    details = load_evaluation_details_from_dir(selected_dir) or {"train": [], "validation": [], "test": []}
+    metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
+    split_meta = metadata.get("split", {}) if isinstance(metadata, dict) else {}
+    training_meta = metadata.get("training", {}) if isinstance(metadata, dict) else {}
+    train_columns = columns_for_table(dataset.dataset_id, "train_records")
+    text_column_options = train_columns or columns_for_table(dataset.dataset_id, "val_records") or columns_for_table(dataset.dataset_id, "test_records")
+    default_text_column = str(training_meta.get("text_column", "") or (text_column_options[0] if text_column_options else ""))
+    default_label_column = str(training_meta.get("label_column", "") or (text_column_options[0] if text_column_options else ""))
+
+    config_col1, config_col2, config_col3 = st.columns(3)
+    with config_col1:
+        text_column = st.selectbox(
+            "验证文本字段",
+            text_column_options,
+            index=option_index(text_column_options, default_text_column, 0) if text_column_options else 0,
+            key=f"result_text_column_{dataset.dataset_id}_{selected_label}",
+        ) if text_column_options else ""
+    with config_col2:
+        label_column = st.selectbox(
+            "验证标签字段",
+            text_column_options,
+            index=option_index(text_column_options, default_label_column, 0) if text_column_options else 0,
+            key=f"result_label_column_{dataset.dataset_id}_{selected_label}",
+        ) if text_column_options else ""
+    with config_col3:
+        reevaluate_clicked = st.button("重新验证当前模型", key=f"reevaluate_model_{dataset.dataset_id}_{selected_label}", type="primary")
+    st.caption("重新验证不会重新训练模型，只会使用当前数据集里的训练集、验证集、测试集重新计算结果。")
+
+    if reevaluate_clicked:
+        if not text_column or not label_column:
+            st.error("请先选择文本字段和标签字段。")
+            return
+        train_records = fetch_table_records(STORE, dataset.dataset_id, "train_records")
+        val_records = fetch_table_records(STORE, dataset.dataset_id, "val_records")
+        test_records = fetch_table_records(STORE, dataset.dataset_id, "test_records")
+        try:
+            train_result = evaluate_saved_model(
+                train_records,
+                EvaluateConfig(
+                    model_dir=selected_dir,
+                    text_column=text_column,
+                    label_column=label_column,
+                    max_length=int(training_meta.get("max_length", 256) or 256),
+                    batch_size=int(training_meta.get("batch_size", 16) or 16),
+                ),
+            )
+            val_result = evaluate_saved_model(
+                val_records,
+                EvaluateConfig(
+                    model_dir=selected_dir,
+                    text_column=text_column,
+                    label_column=label_column,
+                    max_length=int(training_meta.get("max_length", 256) or 256),
+                    batch_size=int(training_meta.get("batch_size", 16) or 16),
+                ),
+            )
+            test_result = evaluate_saved_model(
+                test_records,
+                EvaluateConfig(
+                    model_dir=selected_dir,
+                    text_column=text_column,
+                    label_column=label_column,
+                    max_length=int(training_meta.get("max_length", 256) or 256),
+                    batch_size=int(training_meta.get("batch_size", 16) or 16),
+                ),
+            )
+        except Exception as exc:
+            st.error(str(exc))
+            return
+        result["train_metrics"] = train_result["metrics"]
+        result["best_val_metrics"] = val_result["metrics"]
+        result["test_metrics"] = test_result["metrics"]
+        result["train_size"] = len(train_result["details"])
+        result["val_size"] = len(val_result["details"])
+        result["test_size"] = len(test_result["details"])
+        if not isinstance(result.get("metadata"), dict):
+            result["metadata"] = {}
+        result["metadata"]["training"] = {
+            **training_meta,
+            "text_column": text_column,
+            "label_column": label_column,
+        }
+        (selected_dir / "training_result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        (selected_dir / "evaluation_details.json").write_text(
+            json.dumps(
+                {
+                    "train": train_result["details"],
+                    "validation": val_result["details"],
+                    "test": test_result["details"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        st.success("当前模型已重新验证，结果已更新。")
+        st.rerun()
+
+    st.info(
+        "训练集参与模型学习，分数通常最高；验证集用于挑选最佳模型；测试集只用于最终验收。判断模型是否可用，优先看验证集和测试集。"
     )
+    st.success(
+        f"最近一次训练已完成：训练 {result.get('train_size', 0):,} 行，"
+        f"验证 {result.get('val_size', 0):,} 行，测试 {result.get('test_size', 0):,} 行。"
+    )
+    render_model_assessment(result)
+
+    render_metric_cards("训练集结果（看模型是否学会）", result.get("train_metrics", {}))
+    render_metric_cards("验证集结果（用于选择模型）", result.get("best_val_metrics", {}))
+    render_metric_cards("测试集结果（用于最终验收）", result.get("test_metrics", {}))
+
+    with st.expander("本次验证配置", expanded=False):
+        st.json(
+            {
+                "split": split_meta,
+                "training": training_meta,
+                "model_dir": result.get("model_dir", ""),
+            }
+        )
+
+    render_evaluation_details("训练集逐条结果", details.get("train", []), key=f"train_details_{dataset.dataset_id}")
+    render_evaluation_details("验证集逐条结果", details.get("validation", []), key=f"validation_details_{dataset.dataset_id}")
+    render_evaluation_details("测试集逐条结果", details.get("test", []), key=f"test_details_{dataset.dataset_id}")
+    render_full_prediction_panel(dataset, selected_dir, asset_stats, training_meta)
+
+
+def render_metric_cards(title: str, metrics: dict) -> None:
+    st.markdown(f"##### {title}")
+    if not metrics:
+        st.info("当前没有可展示的指标。")
+        return
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Accuracy（准确率）", format_ratio(metrics.get("accuracy")))
+    metric_cols[1].metric("Precision（精确率）", format_ratio(metrics.get("precision")))
+    metric_cols[2].metric("Recall（召回率）", format_ratio(metrics.get("recall")))
+    metric_cols[3].metric("F1（综合指标）", format_ratio(metrics.get("f1")))
+    metric_cols[4].metric("样本数", f"{metric_support(metrics):,}")
+    st.caption(
+        f"混淆矩阵：TP {int(metrics.get('tp', 0))} / TN {int(metrics.get('tn', 0))} / "
+        f"FP {int(metrics.get('fp', 0))} / FN {int(metrics.get('fn', 0))}"
+        + (f" / Loss（损失值） {float(metrics.get('loss', 0.0)):.4f}" if "loss" in metrics else "")
+    )
+
+
+def render_model_assessment(result: dict) -> None:
+    train_metrics = result.get("train_metrics", {}) if isinstance(result, dict) else {}
+    val_metrics = result.get("best_val_metrics", {}) if isinstance(result, dict) else {}
+    test_metrics = result.get("test_metrics", {}) if isinstance(result, dict) else {}
+    messages = assessment_messages(train_metrics, val_metrics, test_metrics)
+    if not messages:
+        return
+    st.markdown("##### 自动解读")
+    for message in messages:
+        st.write(f"- {message}")
+
+
+def assessment_messages(train_metrics: dict, val_metrics: dict, test_metrics: dict) -> list[str]:
+    messages: list[str] = []
+    train_acc = safe_metric_value(train_metrics.get("accuracy"))
+    val_acc = safe_metric_value(val_metrics.get("accuracy"))
+    test_acc = safe_metric_value(test_metrics.get("accuracy"))
+    if train_acc is None or val_acc is None or test_acc is None:
+        return messages
+    if train_acc - max(val_acc, test_acc) >= 0.1:
+        messages.append("训练集明显高于验证集和测试集，存在过拟合风险。")
+    if abs(val_acc - test_acc) <= 0.03:
+        messages.append("验证集和测试集结果接近，当前模型的泛化稳定性较好。")
+    elif abs(val_acc - test_acc) >= 0.1:
+        messages.append("验证集和测试集差异较大，建议检查划分是否稳定，或增加样本后再评估。")
+    if max(train_acc, val_acc, test_acc) < 0.7:
+        messages.append("三组结果整体偏低，建议优先检查标签质量、文本字段选择和样本量。")
+    if not messages:
+        messages.append("当前三组结果没有明显异常，可以继续结合误判样本做业务复核。")
+    return messages
+
+
+def render_full_prediction_panel(
+    dataset: Dataset,
+    selected_dir: Path,
+    asset_stats: dict[str, int],
+    training_meta: dict,
+) -> None:
+    st.divider()
+    st.markdown("#### 全量判定")
+    st.caption("这里不是验证，而是用当前模型对原始导入数据 `raw_records` 做整表预测，输出完整判定结果。")
+    if not asset_stats.get("raw", 0):
+        st.info("当前没有原始数据，无法执行全量判定。")
+        return
+    job = load_full_prediction_job(dataset.dataset_id)
+    source_columns = columns_for_table(dataset.dataset_id, "raw_records")
+    default_text_column = str(training_meta.get("text_column", "") or (source_columns[0] if source_columns else ""))
+    full_col1, full_col2 = st.columns(2)
+    with full_col1:
+        text_column = st.selectbox(
+            "原始数据文本字段",
+            source_columns,
+            index=option_index(source_columns, default_text_column, 0) if source_columns else 0,
+            key=f"full_prediction_text_{dataset.dataset_id}_{selected_dir.name}",
+        ) if source_columns else ""
+    with full_col2:
+        batch_size = st.number_input(
+            "判定批大小",
+            min_value=1,
+            max_value=256,
+            value=int(training_meta.get("batch_size", 16) or 16),
+            step=1,
+            key=f"full_prediction_batch_{dataset.dataset_id}_{selected_dir.name}",
+        )
+    st.caption("全量判定不会改动模型参数，只会读取 `raw_records`，生成 `predictions` 结果表。")
+    action_col1, action_col2 = st.columns(2)
+    with action_col1:
+        start_clicked = st.button(
+            "开始全量判定",
+            key=f"run_full_prediction_{dataset.dataset_id}_{selected_dir.name}",
+            type="secondary",
+            disabled=bool(job and job.get("status") == "running"),
+        )
+    with action_col2:
+        stop_clicked = st.button(
+            "停止全量判定",
+            key=f"stop_full_prediction_{dataset.dataset_id}_{selected_dir.name}",
+            disabled=not bool(job and job.get("status") == "running"),
+        )
+
+    if start_clicked:
+        if not text_column:
+            st.error("请先选择文本字段。")
+            return
+        existing_predictions = int(asset_stats.get("predictions", 0) or 0)
+        if existing_predictions > 0:
+            st.session_state[full_prediction_confirm_key(dataset.dataset_id)] = {
+                "model_dir": str(selected_dir),
+                "text_column": text_column,
+                "batch_size": int(batch_size),
+                "max_length": int(training_meta.get("max_length", 256) or 256),
+                "total_rows": int(asset_stats.get("raw", 0)),
+                "existing_predictions": existing_predictions,
+            }
+            st.rerun()
+        start_full_prediction_job(
+            dataset.dataset_id,
+            {
+                "model_dir": str(selected_dir),
+                "text_column": text_column,
+                "batch_size": int(batch_size),
+                "max_length": int(training_meta.get("max_length", 256) or 256),
+                "total_rows": int(asset_stats.get("raw", 0)),
+            },
+            resume=False,
+        )
+        set_full_prediction_autorun(dataset.dataset_id, True)
+        st.rerun()
+
+    if stop_clicked and job and job.get("status") == "running":
+        set_full_prediction_autorun(dataset.dataset_id, False)
+        job["status"] = "stopping"
+        job["updated_at"] = datetime.now().isoformat()
+        save_full_prediction_job(dataset.dataset_id, job)
+        st.rerun()
+
+    render_full_prediction_confirmation(dataset.dataset_id, asset_stats)
+
+    job = load_full_prediction_job(dataset.dataset_id)
+    if job:
+        render_full_prediction_status(job)
+        if job.get("status") == "stopping":
+            job["status"] = "stopped"
+            job["updated_at"] = datetime.now().isoformat()
+            save_full_prediction_job(dataset.dataset_id, job)
+            set_full_prediction_autorun(dataset.dataset_id, False)
+            st.warning("全量判定已停止，已完成的结果保留在 predictions 表中。")
+            return
+        if job.get("status") == "running" and not is_full_prediction_autorun(dataset.dataset_id):
+            st.info("检测到一个未完成的全量判定任务。当前不会自动继续，点击“继续全量判定”后才会恢复。")
+            resume_col1, resume_col2 = st.columns(2)
+            with resume_col1:
+                continue_clicked = st.button("继续全量判定", key=f"continue_full_prediction_{dataset.dataset_id}", type="primary")
+            with resume_col2:
+                finish_stop_clicked = st.button("结束未完成任务", key=f"finish_full_prediction_{dataset.dataset_id}")
+            if continue_clicked:
+                set_full_prediction_autorun(dataset.dataset_id, True)
+                st.rerun()
+            if finish_stop_clicked:
+                job["status"] = "stopped"
+                job["updated_at"] = datetime.now().isoformat()
+                save_full_prediction_job(dataset.dataset_id, job)
+                st.rerun()
+            render_partial_prediction_preview(dataset.dataset_id)
+            return
+        if job.get("status") == "running":
+            try:
+                updated_job = process_full_prediction_batch(dataset.dataset_id, job)
+            except Exception as exc:
+                job["status"] = "failed"
+                job["error"] = str(exc)
+                job["updated_at"] = datetime.now().isoformat()
+                save_full_prediction_job(dataset.dataset_id, job)
+                set_full_prediction_autorun(dataset.dataset_id, False)
+                st.error(str(exc))
+                return
+            save_full_prediction_job(dataset.dataset_id, updated_job)
+            if updated_job.get("status") == "completed":
+                set_full_prediction_autorun(dataset.dataset_id, False)
+                st.success(f"全量判定完成：已对原始数据 {int(updated_job.get('processed_rows', 0)):,} 行生成预测结果。")
+                render_partial_prediction_preview(dataset.dataset_id)
+                return
+            st.rerun()
+    render_partial_prediction_preview(dataset.dataset_id)
+
+
+def full_prediction_job_path(dataset_id: str) -> Path:
+    return STORE.dataset_dir(dataset_id) / "jobs" / "full_prediction_job.json"
+
+
+def full_prediction_confirm_key(dataset_id: str) -> str:
+    return f"full_prediction_confirm_{dataset_id}"
+
+
+def full_prediction_autorun_key(dataset_id: str) -> str:
+    return f"full_prediction_autorun_{dataset_id}"
+
+
+def load_full_prediction_job(dataset_id: str) -> dict | None:
+    path = full_prediction_job_path(dataset_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def save_full_prediction_job(dataset_id: str, payload: dict) -> None:
+    path = full_prediction_job_path(dataset_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def clear_full_prediction_confirmation(dataset_id: str) -> None:
+    st.session_state.pop(full_prediction_confirm_key(dataset_id), None)
+
+
+def set_full_prediction_autorun(dataset_id: str, enabled: bool) -> None:
+    st.session_state[full_prediction_autorun_key(dataset_id)] = bool(enabled)
+
+
+def is_full_prediction_autorun(dataset_id: str) -> bool:
+    return bool(st.session_state.get(full_prediction_autorun_key(dataset_id), False))
+
+
+def render_full_prediction_confirmation(dataset_id: str, asset_stats: dict[str, int]) -> None:
+    pending = st.session_state.get(full_prediction_confirm_key(dataset_id))
+    if not pending:
+        return
+    st.warning(
+        f"当前已有 {int(pending.get('existing_predictions', asset_stats.get('predictions', 0) or 0)):,} 行 predictions。"
+        "开始新判定前，请确认是覆盖旧结果还是从现有进度续跑。"
+    )
+    action_col1, action_col2, action_col3 = st.columns(3)
+    with action_col1:
+        overwrite_clicked = st.button("覆盖旧 predictions", key=f"confirm_overwrite_{dataset_id}", type="primary")
+    with action_col2:
+        resume_clicked = st.button("续跑", key=f"confirm_resume_{dataset_id}")
+    with action_col3:
+        cancel_clicked = st.button("取消", key=f"confirm_cancel_{dataset_id}")
+
+    if overwrite_clicked:
+        start_full_prediction_job(dataset_id, pending, resume=False)
+        clear_full_prediction_confirmation(dataset_id)
+        set_full_prediction_autorun(dataset_id, True)
+        st.rerun()
+    if resume_clicked:
+        start_full_prediction_job(dataset_id, pending, resume=True)
+        clear_full_prediction_confirmation(dataset_id)
+        set_full_prediction_autorun(dataset_id, True)
+        st.rerun()
+    if cancel_clicked:
+        clear_full_prediction_confirmation(dataset_id)
+        st.rerun()
+
+
+def start_full_prediction_job(dataset_id: str, config: dict, resume: bool) -> None:
+    total_rows = int(config.get("total_rows", 0) or 0)
+    existing_job = load_full_prediction_job(dataset_id) or {}
+    existing_predictions = int(get_asset_stats(STORE, dataset_id).get("predictions", 0) or 0)
+    if resume:
+        processed_rows = int(existing_job.get("processed_rows", existing_predictions) or 0)
+        created_at = str(existing_job.get("created_at", datetime.now().isoformat()) or datetime.now().isoformat())
+    else:
+        clear_downstream_assets(STORE, dataset_id, "splits")
+        processed_rows = 0
+        created_at = datetime.now().isoformat()
+    save_full_prediction_job(
+        dataset_id,
+        {
+            "status": "running",
+            "model_dir": str(config.get("model_dir", "")),
+            "text_column": str(config.get("text_column", "")),
+            "batch_size": int(config.get("batch_size", 16) or 16),
+            "max_length": int(config.get("max_length", 256) or 256),
+            "processed_rows": min(processed_rows, total_rows),
+            "total_rows": total_rows,
+            "last_batch_rows": 0,
+            "created_at": created_at,
+            "updated_at": datetime.now().isoformat(),
+            "error": "",
+        },
+    )
+
+
+def render_full_prediction_status(job: dict) -> None:
+    processed = int(job.get("processed_rows", 0) or 0)
+    total = int(job.get("total_rows", 0) or 0)
+    percent = 0 if total <= 0 else min(100, int(processed / total * 100))
+    status = str(job.get("status", "idle") or "idle")
+    status_label = {
+        "running": "执行中",
+        "stopping": "停止中",
+        "stopped": "已停止",
+        "completed": "已完成",
+        "failed": "失败",
+    }.get(status, status)
+    st.progress(percent / 100 if total > 0 else 0.0, text=f"全量判定进度 {percent}%")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("当前状态", status_label)
+    col2.metric("已处理行数", f"{processed:,}")
+    col3.metric("总行数", f"{total:,}")
+    if job.get("last_batch_rows"):
+        st.caption(f"最近一批处理 {int(job.get('last_batch_rows', 0)):,} 行。")
+    if job.get("error"):
+        st.error(str(job.get("error")))
+
+
+def process_full_prediction_batch(dataset_id: str, job: dict) -> dict:
+    processed = int(job.get("processed_rows", 0) or 0)
+    total = int(job.get("total_rows", 0) or 0)
+    batch_size = int(job.get("batch_size", 16) or 16)
+    model_dir = Path(str(job.get("model_dir", "")))
+    text_column = str(job.get("text_column", "") or "")
+    if processed >= total:
+        job["status"] = "completed"
+        job["updated_at"] = datetime.now().isoformat()
+        return job
+    records = fetch_table_records(STORE, dataset_id, "raw_records", limit=batch_size, offset=processed)
+    if not records:
+        job["status"] = "completed"
+        job["updated_at"] = datetime.now().isoformat()
+        return job
+    prediction_rows = predict_records(
+        records,
+        PredictConfig(
+            model_dir=model_dir,
+            text_column=text_column,
+            max_length=int(job.get("max_length", 256) or 256),
+            batch_size=batch_size,
+        ),
+    )
+    if processed == 0:
+        replace_records_table(STORE, dataset_id, "predictions", prediction_rows)
+    else:
+        append_records_table(STORE, dataset_id, "predictions", prediction_rows)
+    job["processed_rows"] = processed + len(prediction_rows)
+    job["last_batch_rows"] = len(prediction_rows)
+    job["updated_at"] = datetime.now().isoformat()
+    if int(job["processed_rows"]) >= total:
+        job["status"] = "completed"
+    return job
+
+
+def render_partial_prediction_preview(dataset_id: str) -> None:
+    current_stats = get_asset_stats(STORE, dataset_id)
+    prediction_count = int(current_stats.get("predictions", 0) or 0)
+    if prediction_count <= 0:
+        return
+    st.markdown("##### 当前已完成结果预览")
+    prediction_distribution = label_distribution(STORE, dataset_id, "predictions", "预测标签")
+    positive_count = int(prediction_distribution.get("正样本", 0) or 0)
+    negative_count = int(prediction_distribution.get("负样本", 0) or 0)
+    other_count = max(0, prediction_count - positive_count - negative_count)
+    stat_col1, stat_col2, stat_col3 = st.columns(3)
+    stat_col1.metric("正样本", f"{positive_count:,}")
+    stat_col2.metric("负样本", f"{negative_count:,}")
+    stat_col3.metric("其他/空值", f"{other_count:,}")
+    preview_limit = min(100, prediction_count)
+    preview_rows = preview_table(STORE, dataset_id, "predictions", limit=preview_limit)
+    st.caption(f"当前已写入 predictions：{prediction_count:,} 行，预览前 {preview_limit:,} 行。")
+    st.dataframe(preview_rows, width="stretch", height=320)
+
+
+def render_evaluation_details(title: str, rows: list[dict], key: str) -> None:
+    st.markdown(f"##### {title}")
+    if not rows:
+        st.info("当前没有逐条评估结果。")
+        return
+    view_mode = st.radio("查看范围", ["全部样本", "仅误判样本"], horizontal=True, key=f"{key}_mode", label_visibility="collapsed")
+    filtered = rows if view_mode == "全部样本" else [row for row in rows if not row.get("is_correct")]
+    st.caption(f"{title}：共 {len(filtered):,} 条，默认展示前 200 条。")
+    st.dataframe(filtered[:200], width="stretch", height=360)
+
+
+def format_ratio(value: object) -> str:
+    try:
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def metric_support(metrics: dict) -> int:
+    try:
+        support = int(metrics.get("support", 0))
+    except (TypeError, ValueError):
+        support = 0
+    if support > 0:
+        return support
+    total = 0
+    for key in ["tp", "tn", "fp", "fn"]:
+        try:
+            total += int(metrics.get(key, 0))
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def safe_metric_value(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def render_step_outputs(dataset: Dataset, step: str) -> None:
@@ -966,6 +1563,21 @@ def render_step_outputs(dataset: Dataset, step: str) -> None:
         else:
             st.info("还没有模型训练结果。")
         return
+    if step == "predictions":
+        result = latest_training_result(dataset.dataset_id)
+        if result:
+            st.json(result)
+        if stats.get("predictions", 0) <= 0:
+            if not result:
+                st.info("还没有结果验证或全量判定产物。")
+            return
+        output_tables = [("全量判定结果", "predictions", stats.get("predictions", 0))]
+        options = [f"{label} · {count:,} 行" for label, _, count in output_tables]
+        selected = st.selectbox("选择要查看的产物", options, key=f"output_table_{dataset.dataset_id}_{step}")
+        index = options.index(selected)
+        label, table_name, count = output_tables[index]
+        render_result_table(dataset, step, label, table_name, count)
+        return
 
     output_tables = {
         "raw": [("原始数据", "raw_records", stats.get("raw", 0))],
@@ -979,7 +1591,6 @@ def render_step_outputs(dataset: Dataset, step: str) -> None:
             ("验证集", "val_records", stats.get("val", 0)),
             ("测试集", "test_records", stats.get("test", 0)),
         ],
-        "predictions": [("全量预测结果", "predictions", stats.get("predictions", 0))],
     }.get(step, [])
 
     available = [item for item in output_tables if item[2] > 0]

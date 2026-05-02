@@ -42,6 +42,18 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
+如果你想在 PyCharm 里直接点运行，并在 Run 窗口里看到启动日志，可以改用：
+
+```bash
+python run_judgelab.py
+```
+
+也支持指定端口和日志级别：
+
+```bash
+python run_judgelab.py --port 8502 --log-level debug
+```
+
 启动后浏览器会打开一个本地地址，通常是：
 
 ```text
